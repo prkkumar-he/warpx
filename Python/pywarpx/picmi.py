@@ -2121,7 +2121,13 @@ class HybridPICSolver(picmistandard.base._ClassWithInit):
     plasma_resistivity: float or str
         Value or expression to use for the plasma resistivity in Ohm*m.
         Can be a constant value or an expression depending on ``rho`` (charge density),
-        ``J`` (current density magnitude), and ``t`` (simulation time).
+        ``J`` (current density magnitude), ``t`` (simulation time), ``Te`` (electron
+        temperature in Kelvin) and ``Ti`` (charge-density-weighted mean ion
+        temperature over the charged species, in Kelvin, from their shape-aware
+        temperature deposits -- which are enabled automatically when ``Ti`` is
+        used). The temperatures support e.g. a Chodura anomalous resistivity
+        with the drift threshold ``sqrt(kb*(Ti+Zeff*Te)/m_i)``, or a Spitzer
+        ``Te^-3/2`` collisional floor, evaluated at the local temperatures.
 
     plasma_hyper_resistivity: float or str
         Value or expression to use for the plasma hyper-resistivity in Ohm*m^3.
@@ -2134,10 +2140,14 @@ class HybridPICSolver(picmistandard.base._ClassWithInit):
         in Ohm*m. The expression may depend on ``rho_s`` (the species charge
         density), ``rho`` (total charge density which, by quasineutrality,
         equals the electron charge density), ``Te`` (electron temperature
-        in Kelvin), ``J`` (plasma current density magnitude), ``J_s`` (the
-        species current density magnitude), ``B`` (magnetic field magnitude)
-        and ``t`` (time). The effective resistivity applied to species ``s``
-        in Ohm's law, the Joule heating source and the resistive drag is
+        in Kelvin), ``Ti`` (this species' own temperature in Kelvin, from its
+        shape-aware temperature deposit -- enabled automatically when ``Ti``
+        is used; note this is the species' own T, not the species-averaged
+        ``Ti`` the global expression sees), ``J`` (plasma current density
+        magnitude), ``J_s`` (the species current density magnitude), ``B``
+        (magnetic field magnitude) and ``t`` (time). The effective resistivity
+        applied to species ``s`` in Ohm's law, the Joule heating source and
+        the resistive drag is
         ``plasma_resistivity + plasma_resistivity_species[s]``.
 
     solve_electron_energy_equation: bool, default=False
@@ -2362,7 +2372,7 @@ class HybridPICSolver(picmistandard.base._ClassWithInit):
         if self.plasma_resistivity_species is not None:
             for name, expr in self.plasma_resistivity_species.items():
                 pywarpx.hybridpicmodel.__setattr__(
-                    f"plasma_resistivity_{name}(rho_s,rho,Te,J,J_s,B,t)",
+                    f"plasma_resistivity_{name}(rho_s,rho,Te,Ti,J,J_s,B,t)",
                     pywarpx.my_constants.mangle_expression(expr, self.mangle_dict),
                 )
         # Only emit the electron-energy-equation attributes that were

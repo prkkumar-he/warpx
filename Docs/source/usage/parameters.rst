@@ -2889,7 +2889,7 @@ Details about the collision models can be found in the :ref:`theory section <mul
       Each species' bulk velocity is relaxed toward the electron fluid velocity at the rate
       :math:`\nu_{s,e} = Z_s e^2 \eta_{s,\mathrm{eff}} n_e / m_s` implied by the Ohm's-law
       resistivity (global plus the optional per-species overlay,
-      :pp:param:`hybrid_pic_model.plasma_resistivity_<species>(rho_s,rho,Te,J,J_s,B,t)`),
+      :pp:param:`hybrid_pic_model.plasma_resistivity_<species>(rho_s,rho,Te,Ti,J,J_s,B,t)`),
       via a velocity-independent bulk-velocity shift
       :math:`(\boldsymbol{V}_s - \boldsymbol{V}_e)\left(1 - e^{-\nu_{s,e}\Delta t}\right)`
       gathered at each particle's position, which decelerates the bulk drift while
@@ -3784,6 +3784,16 @@ Maxwell solver: kinetic-fluid hybrid
     :optional:
 
     If :pp:param:`algo.maxwell_solver` is set to ``hybrid``, this sets the plasma resistivity in :math:`\Omega m`.
+    Besides the charge density ``rho`` (:math:`C/m^3`), the current-density magnitude ``J`` (:math:`A/m^2`)
+    and the time ``t`` (:math:`s`), the expression may use the temperatures ``Te`` and ``Ti`` (both :math:`K`;
+    these symbol names are reserved in this expression and shadow ``my_constants`` of the same name):
+    ``Te`` is the electron temperature consumed by the Ohm's-law solve (from the polytropic closure, or evolved
+    when :pp:param:`hybrid_pic_model.solve_electron_energy_equation` is on) and ``Ti`` the charge-density-weighted
+    mean ion temperature over the charged species, built from their shape-aware temperature deposits
+    (:pp:param:`\<species_name\>.do_temperature_deposition` is enabled automatically when ``Ti`` is used).
+    This supports temperature-dependent resistivity models evaluated at the local temperatures, e.g. a Chodura
+    anomalous resistivity whose drift threshold is the thermal speed :math:`\sqrt{k_B (T_i + Z_\mathrm{eff} T_e)/m_i}`,
+    or a Spitzer :math:`T_e^{-3/2}` collisional floor.
 
 .. pp:param:: hybrid_pic_model.plasma_hyper_resistivity(rho,B)
     :type: ``float`` or ``str``
@@ -3792,7 +3802,7 @@ Maxwell solver: kinetic-fluid hybrid
 
     If :pp:param:`algo.maxwell_solver` is set to ``hybrid``, this sets the plasma hyper-resistivity in :math:`\Omega m^3`.
 
-.. pp:param:: hybrid_pic_model.plasma_resistivity_<species>(rho_s,rho,Te,J,J_s,B,t)
+.. pp:param:: hybrid_pic_model.plasma_resistivity_<species>(rho_s,rho,Te,Ti,J,J_s,B,t)
     :type: ``float`` or ``str``
     :default: ``0``
     :optional:
@@ -3801,6 +3811,9 @@ Maxwell solver: kinetic-fluid hybrid
     for the named charged species, on top of :pp:param:`hybrid_pic_model.plasma_resistivity(rho,J,t)`
     (see the :ref:`theory section <theory-kinetic-fluid-hybrid-model>`). The expression can depend on the species
     charge density ``rho_s`` and total charge density ``rho`` (:math:`C/m^3`), the electron temperature ``Te`` (:math:`K`),
+    this species' own temperature ``Ti`` (:math:`K`, the scalar collapse of its shape-aware temperature deposit,
+    which is enabled automatically when ``Ti`` is used; note this is the species' own temperature, not the
+    species-averaged ``Ti`` seen by the global expression),
     the current-density magnitudes ``J`` and ``J_s`` (:math:`A/m^2`), the magnetic-field magnitude ``B`` (:math:`T`)
     and the time ``t`` (:math:`s`). The same effective per-species resistivity enters the Joule-heating source of the
     electron energy equation when :pp:param:`hybrid_pic_model.include_joule_heating` is on.

@@ -73,6 +73,14 @@ void WarpX::HybridPICEvolveFields ()
         m_hybrid_pic_model->CalculateElectronPressure();
     }
 
+    // Gridded ion temperatures for the resistivity parsers (the global
+    // weighted mean and any per-species scalars), built once per step from
+    // the shape-aware T_<species> deposits of HybridPICDepositRhoAndJ.
+    // Returns immediately when no resistivity expression uses Ti.
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        m_hybrid_pic_model->ComputeIonTemperatureFields(lev);
+    }
+
     // Get the external current
     m_hybrid_pic_model->GetCurrentExternal();
 
@@ -459,6 +467,14 @@ void WarpX::HybridPICInitializeRhoJandB ()
     // the restored rho: evolved T_e structure is not preserved across a restart.
     m_hybrid_pic_model->CalculateElectronPressure(
         m_hybrid_pic_model->m_solve_electron_energy_equation);
+
+    // Seed the gridded ion temperatures for a Ti-dependent resistivity, so
+    // the first step's E-solves (and a resistive drag running before the
+    // first HybridPICEvolveFields) see the t=0 deposits rather than zeros.
+    // No-op when no resistivity expression uses Ti.
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        m_hybrid_pic_model->ComputeIonTemperatureFields(lev);
+    }
 
     if (restart_chkfile.empty()) {
         // Handle field splitting for Hybrid field push

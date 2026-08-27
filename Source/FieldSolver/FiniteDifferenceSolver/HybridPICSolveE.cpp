@@ -544,6 +544,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
     const auto eta_h = hybrid_model->m_eta_h;
     const auto rho_floor = hybrid_model->m_n_floor * PhysConst::q_e;
     const auto resistivity_has_J_dependence = hybrid_model->m_resistivity_has_J_dependence;
+    const auto resistivity_has_Te_dependence = hybrid_model->m_resistivity_has_Te_dependence;
+    const auto resistivity_has_Ti_dependence = hybrid_model->m_resistivity_has_Ti_dependence;
     const auto hyper_resistivity_has_B_dependence = hybrid_model->m_hyper_resistivity_has_B_dependence;
     const bool include_hyper_resistivity_term = hybrid_model->m_include_hyper_resistivity_term;
 
@@ -570,6 +572,18 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
         Bfield_external = warpx.m_fields.get_alldirs(FieldType::hybrid_B_fp_external, 0); // lev=0
         Efield_external = warpx.m_fields.get_alldirs(FieldType::hybrid_E_fp_external, 0); // lev=0
     }
+
+    // Optional temperature arguments of the eta parser (both nodal like rho,
+    // in Kelvin, frozen per step): Te as consumed by this E-solve's pressure
+    // term, Ti the weighted-mean ion temperature filled by
+    // ComputeIonTemperatureFields. Only fetched (Ti: only allocated) when
+    // the expression uses them.
+    amrex::MultiFab const * Te_mf = resistivity_has_Te_dependence
+        ? warpx.m_fields.get(FieldType::hybrid_electron_temperature_fp, lev)
+        : nullptr;
+    amrex::MultiFab const * Ti_mf = resistivity_has_Ti_dependence
+        ? warpx.m_fields.get("hybrid_ion_temperature_fp", lev)
+        : nullptr;
 
     // Index type required for interpolating fields from their respective
     // staggering to the Ex, Ey, Ez locations
@@ -731,6 +745,10 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
             eta_coef_t = eta_coef_mf[1]->const_array(mfi);
             eta_coef_z = eta_coef_mf[2]->const_array(mfi);
         }
+        // Default-constructed (never indexed) unless the matching flag.
+        Array4<Real const> Te_arr, Ti_arr;
+        if (resistivity_has_Te_dependence) { Te_arr = Te_mf->const_array(mfi); }
+        if (resistivity_has_Ti_dependence) { Ti_arr = Ti_mf->const_array(mfi); }
 
         // Extract structures indicating where the fields
         // should be updated, given the position of the embedded boundaries
@@ -803,7 +821,12 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                         jtot_val = std::sqrt(jr_val*jr_val + jtheta_val*jtheta_val + jz_val*jz_val);
                     }
 
-                    Er(i, j, 0) += eta(rho_val, jtot_val, t_new) * Jr(i, j, 0);
+                    const Real Te_val = resistivity_has_Te_dependence ?
+                        Interp(Te_arr, nodal, Er_stag, coarsen, i, j, 0, 0) : 0._rt;
+                    const Real Ti_val = resistivity_has_Ti_dependence ?
+                        Interp(Ti_arr, nodal, Er_stag, coarsen, i, j, 0, 0) : 0._rt;
+
+                    Er(i, j, 0) += eta(rho_val, jtot_val, t_new, Te_val, Ti_val) * Jr(i, j, 0);
                     // Per-species resistive friction (Phys. Plasmas 31, 012902 (2024)):
                     // frozen ion-drift remainder plus the lagged coefficient
                     // times the live plasma current.
@@ -881,7 +904,13 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                         jtot_val = std::sqrt(jr_val*jr_val + jtheta_val*jtheta_val + jz_val*jz_val);
                     }
 
-                    Etheta(i, j, 0) += eta(rho_val, jtot_val, t_new) * Jtheta(i, j, 0);
+                    const Real Te_val = resistivity_has_Te_dependence ?
+                        Interp(Te_arr, nodal, Etheta_stag, coarsen, i, j, 0, 0) : 0._rt;
+                    const Real Ti_val = resistivity_has_Ti_dependence ?
+                        Interp(Ti_arr, nodal, Etheta_stag, coarsen, i, j, 0, 0) : 0._rt;
+
+                    Etheta(i, j, 0) +=
+                        eta(rho_val, jtot_val, t_new, Te_val, Ti_val) * Jtheta(i, j, 0);
                     if (has_eta_overlay) {
                         Etheta(i, j, 0) += eta_overlay_t(i, j, 0)
                                            + eta_coef_t(i, j, 0) * Jtheta(i, j, 0);
@@ -953,7 +982,12 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                         jtot_val = std::sqrt(jr_val*jr_val + jtheta_val*jtheta_val + jz_val*jz_val);
                     }
 
-                    Ez(i, j, 0) += eta(rho_val, jtot_val, t_new) * Jz(i, j, 0);
+                    const Real Te_val = resistivity_has_Te_dependence ?
+                        Interp(Te_arr, nodal, Ez_stag, coarsen, i, j, 0, 0) : 0._rt;
+                    const Real Ti_val = resistivity_has_Ti_dependence ?
+                        Interp(Ti_arr, nodal, Ez_stag, coarsen, i, j, 0, 0) : 0._rt;
+
+                    Ez(i, j, 0) += eta(rho_val, jtot_val, t_new, Te_val, Ti_val) * Jz(i, j, 0);
                     if (has_eta_overlay) {
                         Ez(i, j, 0) += eta_overlay_z(i, j, 0)
                                        + eta_coef_z(i, j, 0) * Jz(i, j, 0);
@@ -1040,6 +1074,8 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
     const auto eta_h = hybrid_model->m_eta_h;
     const auto rho_floor = hybrid_model->m_n_floor * PhysConst::q_e;
     const auto resistivity_has_J_dependence = hybrid_model->m_resistivity_has_J_dependence;
+    const auto resistivity_has_Te_dependence = hybrid_model->m_resistivity_has_Te_dependence;
+    const auto resistivity_has_Ti_dependence = hybrid_model->m_resistivity_has_Ti_dependence;
     const auto hyper_resistivity_has_B_dependence = hybrid_model->m_hyper_resistivity_has_B_dependence;
     const bool include_hyper_resistivity_term = hybrid_model->m_include_hyper_resistivity_term;
 
@@ -1059,6 +1095,18 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
         Bfield_external = warpx.m_fields.get_alldirs(FieldType::hybrid_B_fp_external, 0); // lev=0
         Efield_external = warpx.m_fields.get_alldirs(FieldType::hybrid_E_fp_external, 0); // lev=0
     }
+
+    // Optional temperature arguments of the eta parser (both nodal like rho,
+    // in Kelvin, frozen per step): Te as consumed by this E-solve's pressure
+    // term, Ti the weighted-mean ion temperature filled by
+    // ComputeIonTemperatureFields. Only fetched (Ti: only allocated) when
+    // the expression uses them.
+    amrex::MultiFab const * Te_mf = resistivity_has_Te_dependence
+        ? warpx.m_fields.get(FieldType::hybrid_electron_temperature_fp, lev)
+        : nullptr;
+    amrex::MultiFab const * Ti_mf = resistivity_has_Ti_dependence
+        ? warpx.m_fields.get("hybrid_ion_temperature_fp", lev)
+        : nullptr;
 
     // Index type required for interpolating fields from their respective
     // staggering to the Ex, Ey, Ez locations
@@ -1219,6 +1267,10 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
             eta_coef_y = eta_coef_mf[1]->const_array(mfi);
             eta_coef_z = eta_coef_mf[2]->const_array(mfi);
         }
+        // Default-constructed (never indexed) unless the matching flag.
+        Array4<Real const> Te_arr, Ti_arr;
+        if (resistivity_has_Te_dependence) { Te_arr = Te_mf->const_array(mfi); }
+        if (resistivity_has_Ti_dependence) { Ti_arr = Ti_mf->const_array(mfi); }
 
         // Extract structures indicating where the fields
         // should be updated, given the position of the embedded boundaries
@@ -1287,7 +1339,12 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                     jtot_val = std::sqrt(jx_val*jx_val + jy_val*jy_val + jz_val*jz_val);
                 }
 
-                Ex(i, j, k) += eta(rho_val, jtot_val, t_new) * Jx(i, j, k);
+                const Real Te_val = resistivity_has_Te_dependence ?
+                    Interp(Te_arr, nodal, Ex_stag, coarsen, i, j, k, 0) : 0._rt;
+                const Real Ti_val = resistivity_has_Ti_dependence ?
+                    Interp(Ti_arr, nodal, Ex_stag, coarsen, i, j, k, 0) : 0._rt;
+
+                Ex(i, j, k) += eta(rho_val, jtot_val, t_new, Te_val, Ti_val) * Jx(i, j, k);
                 // Per-species resistive friction: frozen ion-drift remainder
                 // plus the lagged coefficient times the live plasma current.
                 if (has_eta_overlay) {
@@ -1357,7 +1414,12 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                     jtot_val = std::sqrt(jx_val*jx_val + jy_val*jy_val + jz_val*jz_val);
                 }
 
-                Ey(i, j, k) += eta(rho_val, jtot_val, t_new) * Jy(i, j, k);
+                const Real Te_val = resistivity_has_Te_dependence ?
+                    Interp(Te_arr, nodal, Ey_stag, coarsen, i, j, k, 0) : 0._rt;
+                const Real Ti_val = resistivity_has_Ti_dependence ?
+                    Interp(Ti_arr, nodal, Ey_stag, coarsen, i, j, k, 0) : 0._rt;
+
+                Ey(i, j, k) += eta(rho_val, jtot_val, t_new, Te_val, Ti_val) * Jy(i, j, k);
                 if (has_eta_overlay) {
                     Ey(i, j, k) += eta_overlay_y(i, j, k)
                                    + eta_coef_y(i, j, k) * Jy(i, j, k);
@@ -1425,7 +1487,12 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                     jtot_val = std::sqrt(jx_val*jx_val + jy_val*jy_val + jz_val*jz_val);
                 }
 
-                Ez(i, j, k) += eta(rho_val, jtot_val, t_new) * Jz(i, j, k);
+                const Real Te_val = resistivity_has_Te_dependence ?
+                    Interp(Te_arr, nodal, Ez_stag, coarsen, i, j, k, 0) : 0._rt;
+                const Real Ti_val = resistivity_has_Ti_dependence ?
+                    Interp(Ti_arr, nodal, Ez_stag, coarsen, i, j, k, 0) : 0._rt;
+
+                Ez(i, j, k) += eta(rho_val, jtot_val, t_new, Te_val, Ti_val) * Jz(i, j, k);
                 if (has_eta_overlay) {
                     Ez(i, j, k) += eta_overlay_z(i, j, k)
                                    + eta_coef_z(i, j, k) * Jz(i, j, k);

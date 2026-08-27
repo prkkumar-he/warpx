@@ -295,7 +295,7 @@ can instead be resolved per species by adding to Ohm's law the overlay
 where :math:`f_s` is the charge-density fraction of species :math:`s`,
 :math:`\vec{V}_s` its fluid velocity, and each :math:`\eta_s` is a user
 expression of :math:`(\rho_s, \rho, T_e, |\vec{J}|, |\vec{J}_s|, |\vec{B}|, t)`
-(``hybrid_pic_model.plasma_resistivity_<species>(rho_s,rho,Te,J,J_s,B,t)``).
+(``hybrid_pic_model.plasma_resistivity_<species>(rho_s,rho,Te,Ti,J,J_s,B,t)``).
 This permits, for example, a temperature-dependent Spitzer drag against one
 species on top of a constant background resistivity. When all ion species
 drift together the overlay reduces to

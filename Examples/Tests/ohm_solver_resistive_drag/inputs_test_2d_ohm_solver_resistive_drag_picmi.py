@@ -68,11 +68,12 @@ class ResistiveDragMomentum(object):
     DIAG_EVERY = 150
     substeps = 20
 
-    def __init__(self, test, verbose, eta_scale, per_species_eta):
+    def __init__(self, test, verbose, eta_scale, per_species_eta, ti_dependent_eta):
         self.test = test
         self.verbose = verbose or test
         self.eta_scale = eta_scale
         self.per_species_eta = per_species_eta
+        self.ti_dependent_eta = ti_dependent_eta
 
         if self.test:
             self.NX = 32
@@ -189,7 +190,26 @@ class ResistiveDragMomentum(object):
         # split consumed by the substepped E-solves) against the same theory
         # as the global path. RKF45 is enabled in this variant so the
         # adaptive integrator is the consumer.
-        if self.per_species_eta:
+        # With --ti-dependent-eta the same constant eta is written as
+        # eta * Ti / Ti0, with Ti the parsers' local ion temperature in
+        # Kelvin (from the shape-aware temperature deposit) and Ti0 the
+        # deck's 500 eV converted to Kelvin through the predefined parser
+        # constants. Half enters through the global parser (whose Ti is the
+        # charge-density-weighted species mean) and half through the
+        # per-species overlay (whose Ti is this species' own temperature);
+        # for the single Maxwellian species both average to Ti0, so every
+        # observable below follows the same constant-eta theory -- broken
+        # Ti plumbing (zeros, or wrong units) fails the resistive-decay
+        # check. The 0*Te term is a no-op that exercises the
+        # electron-temperature argument with no physics change.
+        if self.ti_dependent_eta:
+            ti0_K = f"({self.ti_eV} * q_e / kb)"
+            half_eta_expr = f"{0.5 * self.eta} * Ti / {ti0_K} + 0.0*Te"
+            resistivity_kwargs = dict(
+                plasma_resistivity=half_eta_expr,
+                plasma_resistivity_species={"ions": half_eta_expr},
+            )
+        elif self.per_species_eta:
             resistivity_kwargs = dict(
                 plasma_resistivity=0.0,
                 plasma_resistivity_species={"ions": f"{self.eta}"},
@@ -313,6 +333,13 @@ parser.add_argument(
     "RKF45 adaptive substepping) instead of the global parser",
     action="store_true",
 )
+parser.add_argument(
+    "--ti-dependent-eta",
+    help="write the same constant eta as eta * Ti / Ti0 (half through the "
+    "global parser, half through the per-species overlay), validating the "
+    "ion-temperature parser arguments against the constant-eta theory",
+    action="store_true",
+)
 args, left = parser.parse_known_args()
 sys.argv = sys.argv[:1] + left
 
@@ -321,5 +348,6 @@ run = ResistiveDragMomentum(
     verbose=args.verbose,
     eta_scale=args.eta_scale,
     per_species_eta=args.per_species_eta,
+    ti_dependent_eta=args.ti_dependent_eta,
 )
 simulation.step()

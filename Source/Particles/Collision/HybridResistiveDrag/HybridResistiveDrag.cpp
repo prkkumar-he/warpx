@@ -65,8 +65,19 @@ HybridResistiveDrag::doCollisions (amrex::Real /*cur_time*/, amrex::Real dt,
     // eta_s_eff = eta_global + eta_s_per as Ohm's law and the Joule source.
     auto const eta_per_it     = hybrid_model->m_eta_per_species.find(m_species_names[0]);
     bool const has_eta_per    = (eta_per_it != hybrid_model->m_eta_per_species.end());
-    amrex::ParserExecutor<7> eta_s_per{};
+    amrex::ParserExecutor<8> eta_s_per{};
     if (has_eta_per) { eta_s_per = eta_per_it->second; }
+
+    // Optional temperature arguments (Kelvin, nodal fields, frozen per
+    // step): Te feeds the global parser (when its expression uses it) and
+    // the per-species overlay; the Ti fields are filled by
+    // ComputeIonTemperatureFields -- the weighted species mean for the
+    // global parser, this species' own scalar for the overlay.
+    bool const eta_has_Te = hybrid_model->m_resistivity_has_Te_dependence;
+    bool const eta_has_Ti = hybrid_model->m_resistivity_has_Ti_dependence;
+    bool const has_Ti_per = has_eta_per &&
+        (hybrid_model->m_per_species_eta_uses_Ti.count(m_species_names[0]) > 0);
+    bool const need_Te = has_eta_per || eta_has_Te;
 
     amrex::Real const species_mass = species.getMass();
     amrex::Real const Z_s          = species.getCharge() / PhysConst::q_e;
@@ -98,6 +109,12 @@ HybridResistiveDrag::doCollisions (amrex::Real /*cur_time*/, amrex::Real dt,
             *warpx.m_fields.get("rho_fp_" + m_species_names[0], lev);
         amrex::MultiFab const & Te_fp       =
             *warpx.m_fields.get(FieldType::hybrid_electron_temperature_fp, lev);
+        // Only fetched (and only allocated) when the expressions use Ti.
+        amrex::MultiFab const * Ti_glob_fp  = eta_has_Ti
+            ? warpx.m_fields.get("hybrid_ion_temperature_fp", lev) : nullptr;
+        amrex::MultiFab const * Ti_s_fp     = has_Ti_per
+            ? warpx.m_fields.get("hybrid_ion_temperature_fp_" + m_species_names[0], lev)
+            : nullptr;
 
         amrex::XDim3 const dinv = WarpX::InvCellSize(lev);
         auto const dxi = warpx.Geom(lev).InvCellSizeArray();
@@ -130,6 +147,10 @@ HybridResistiveDrag::doCollisions (amrex::Real /*cur_time*/, amrex::Real dt,
             auto const rho_arr  = rho_fp.const_array(pti);
             auto const rhos_arr = rhos_fp.const_array(pti);
             auto const Te_arr   = Te_fp.const_array(pti);
+            // Default-constructed (never indexed) unless the matching flag.
+            amrex::Array4<amrex::Real const> Ti_glob_arr, Tis_arr;
+            if (eta_has_Ti) { Ti_glob_arr = Ti_glob_fp->const_array(pti); }
+            if (has_Ti_per) { Tis_arr     = Ti_s_fp->const_array(pti); }
 
             amrex::IndexType const Vex_type = Ve_fp[0]->ixType();
             amrex::IndexType const Vey_type = Ve_fp[1]->ixType();
@@ -191,15 +212,33 @@ HybridResistiveDrag::doCollisions (amrex::Real /*cur_time*/, amrex::Real dt,
                 if (rho_val <= rho_floor) { return; }
 
                 amrex::Real const Jmag = std::sqrt(Jxp*Jxp + Jyp*Jyp + Jzp*Jzp);
-                amrex::Real eta_s_eff = eta_func(rho_val, Jmag, t_now);
 
-                // Per-species overlay eta_s_per(rho_s, rho, Te, |J|, |J_s|,
-                // |B|, t), added to the global eta.
+                // Optional temperature arguments (Kelvin): Te is gathered
+                // once and shared by the global and per-species parsers;
+                // the Ti gathers stay behind their flags.
+                amrex::Real Te_val = 0._rt;
+                if (need_Te) {
+                    Te_val = ablastr::particles::doGatherScalarFieldNodal(
+                        xp, yp, zp, Te_arr, dxi, plo);
+                }
+                amrex::Real Ti_glob_val = 0._rt;
+                if (eta_has_Ti) {
+                    Ti_glob_val = ablastr::particles::doGatherScalarFieldNodal(
+                        xp, yp, zp, Ti_glob_arr, dxi, plo);
+                }
+                amrex::Real eta_s_eff =
+                    eta_func(rho_val, Jmag, t_now, Te_val, Ti_glob_val);
+
+                // Per-species overlay eta_s_per(rho_s, rho, Te, Ti, |J|,
+                // |J_s|, |B|, t), added to the global eta.
                 if (has_eta_per) {
                     amrex::Real const rhos_val = ablastr::particles::doGatherScalarFieldNodal(
                         xp, yp, zp, rhos_arr, dxi, plo);
-                    amrex::Real const Te_val   = ablastr::particles::doGatherScalarFieldNodal(
-                        xp, yp, zp, Te_arr, dxi, plo);
+                    amrex::Real Ti_s_val = 0._rt;
+                    if (has_Ti_per) {
+                        Ti_s_val = ablastr::particles::doGatherScalarFieldNodal(
+                            xp, yp, zp, Tis_arr, dxi, plo);
+                    }
                     amrex::ParticleReal Jsxp = 0._prt, Jsyp = 0._prt, Jszp = 0._prt;
                     // Discarded B-slot outputs of the gather (B was already
                     // gathered above).
@@ -211,7 +250,7 @@ HybridResistiveDrag::doCollisions (amrex::Real /*cur_time*/, amrex::Real dt,
                                    nox, galerkin_interpolation);
                     amrex::Real const Jsmag = std::sqrt(Jsxp*Jsxp + Jsyp*Jsyp + Jszp*Jszp);
                     amrex::Real const Bmag  = std::sqrt(Bxp*Bxp + Byp*Byp + Bzp*Bzp);
-                    eta_s_eff += eta_s_per(rhos_val, rho_val, Te_val,
+                    eta_s_eff += eta_s_per(rhos_val, rho_val, Te_val, Ti_s_val,
                                            Jmag, Jsmag, Bmag, t_now);
                 }
 

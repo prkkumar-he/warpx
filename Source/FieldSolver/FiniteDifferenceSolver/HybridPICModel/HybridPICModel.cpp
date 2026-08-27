@@ -82,6 +82,21 @@ void HybridPICModel::ReadParameters ()
     pp_hybrid.query("plasma_resistivity(rho,J,t)", m_eta_expression);
     pp_hybrid.query("plasma_hyper_resistivity(rho,B)", m_eta_h_expression);
 
+    // Detect here (not in InitData) which optional symbols the global
+    // resistivity expression uses: AllocateLevelMFs gates the
+    // hybrid_ion_temperature_fp allocation on the Ti flag, and the
+    // per-species field needs derived below depend on it too. The real
+    // parser is compiled in InitData; this throwaway one only reports the
+    // symbols surviving my_constants substitution.
+    {
+        auto const throwaway_parser =
+            utils::parser::makeParser(m_eta_expression, {"rho","J","t","Te","Ti"});
+        std::set<std::string> const symbols = throwaway_parser.symbols();
+        m_resistivity_has_J_dependence  = (symbols.count("J")  > 0);
+        m_resistivity_has_Te_dependence = (symbols.count("Te") > 0);
+        m_resistivity_has_Ti_dependence = (symbols.count("Ti") > 0);
+    }
+
     utils::parser::queryWithParser(pp_hybrid, "n_floor", m_n_floor);
 
     // Master gate for the electron-energy equation. When enabled, K_e is
@@ -140,9 +155,17 @@ void HybridPICModel::ReadParameters ()
         for (auto const & spec_name : species_names) {
             std::string expr;
             if (pp_hybrid.query(
-                "plasma_resistivity_" + spec_name + "(rho_s,rho,Te,J,J_s,B,t)",
+                "plasma_resistivity_" + spec_name + "(rho_s,rho,Te,Ti,J,J_s,B,t)",
                 expr)) {
                 m_has_per_species_eta = true;
+                // Species whose overlay expression uses Ti additionally need
+                // their own gridded scalar temperature (allocation gated on
+                // this set; deposition auto-enabled at species construction).
+                auto const throwaway_parser = utils::parser::makeParser(
+                    expr, {"rho_s","rho","Te","Ti","J","J_s","B","t"});
+                if (throwaway_parser.symbols().count("Ti") > 0) {
+                    m_per_species_eta_uses_Ti.insert(spec_name);
+                }
             }
         }
 
@@ -164,8 +187,11 @@ void HybridPICModel::ReadParameters ()
 
         m_need_fluid_velocities   = m_has_per_species_eta || m_has_resistive_drag
                                   || m_include_temperature_relaxation;
+        // A Ti-dependent global resistivity needs the rho_fp_<species>
+        // deposits as the weights of the mean ion temperature.
         m_need_per_species_fields = m_need_fluid_velocities
-                                  || m_solve_electron_energy_equation;
+                                  || m_solve_electron_energy_equation
+                                  || m_resistivity_has_Ti_dependence;
     }
 
     // convert electron temperature from eV to J
@@ -313,6 +339,13 @@ void HybridPICModel::AllocateLevelMFs (
                 lev, amrex::convert(ba, jz_nodal_flag), dm, ncomps, ngJ_plasma, 0.0_rt);
             fields.alloc_init("rho_fp_" + spec,
                 lev, amrex::convert(ba, rho_nodal_flag), dm, ncomps, ngRho, 0.0_rt);
+            // This species' own scalar temperature (Kelvin, nodal like rho),
+            // the Ti argument of its per-species resistivity parser. Filled
+            // once per step by ComputeIonTemperatureFields.
+            if (m_per_species_eta_uses_Ti.count(spec) > 0) {
+                fields.alloc_init("hybrid_ion_temperature_fp_" + spec,
+                    lev, amrex::convert(ba, rho_nodal_flag), dm, ncomps, ngRho, 0.0_rt);
+            }
             if (m_need_fluid_velocities) {
                 fields.alloc_init("Vs_fp_" + spec, Direction{0},
                     lev, amrex::convert(ba, jx_nodal_flag), dm, ncomps, ngJ_gather, 0.0_rt);
@@ -329,6 +362,15 @@ void HybridPICModel::AllocateLevelMFs (
         // rho_floor applies to it. Shared by the Joule, Q_ei and
         // per-species-resistivity consumers.
         fields.alloc_init("hybrid_rho_species_sum_fp",
+            lev, amrex::convert(ba, rho_nodal_flag), dm, ncomps, ngRho, 0.0_rt);
+    }
+
+    // Charge-density-weighted mean ion temperature (Kelvin, nodal like rho),
+    // the Ti argument of the global plasma_resistivity parser. Filled once
+    // per step by ComputeIonTemperatureFields from the shape-aware
+    // T_<species> deposits.
+    if (m_resistivity_has_Ti_dependence) {
+        fields.alloc_init("hybrid_ion_temperature_fp",
             lev, amrex::convert(ba, rho_nodal_flag), dm, ncomps, ngRho, 0.0_rt);
     }
 
@@ -396,11 +438,12 @@ void HybridPICModel::AllocateLevelMFs (
 
 void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
 {
+    // The optional symbols (J, Te, Ti) were already detected in
+    // ReadParameters, where the allocation and deposition gates need them;
+    // here the expression is compiled for the kernels.
     m_resistivity_parser = std::make_unique<amrex::Parser>(
-        utils::parser::makeParser(m_eta_expression, {"rho","J","t"}));
-    m_eta = m_resistivity_parser->compile<3>();
-    const std::set<std::string> resistivity_symbols = m_resistivity_parser->symbols();
-    m_resistivity_has_J_dependence += resistivity_symbols.count("J");
+        utils::parser::makeParser(m_eta_expression, {"rho","J","t","Te","Ti"}));
+    m_eta = m_resistivity_parser->compile<5>();
 
     // Electron-ion energy-equilibration rate nu_ei(rho,Te,Ti,t) for the Q_ei term.
     m_nu_ei_parser = std::make_unique<amrex::Parser>(
@@ -409,7 +452,7 @@ void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
 
     // --- Per-species resistivity overlay (Phys. Plasmas 31, 012902 (2024), Eq. 10) ---
     // Optional. For any charged species {spec} the user may supply
-    //   hybrid_pic_model.plasma_resistivity_{spec}(rho_s,rho,Te,J,J_s,B,t)="..."
+    //   hybrid_pic_model.plasma_resistivity_{spec}(rho_s,rho,Te,Ti,J,J_s,B,t)="..."
     // overlaid on the global parser: Ohm's law, the Joule-heating source and
     // the resistive drag all use eta_s_eff = eta_global + eta_per_species_s.
     // Compiled here rather than in ReadParameters because the particle
@@ -419,7 +462,7 @@ void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
         auto const & mypc = WarpX::GetInstance().GetPartContainer();
         for (auto const & spec_name : mypc.GetSpeciesNames()) {
             std::string const param_name =
-                "plasma_resistivity_" + spec_name + "(rho_s,rho,Te,J,J_s,B,t)";
+                "plasma_resistivity_" + spec_name + "(rho_s,rho,Te,Ti,J,J_s,B,t)";
             std::string expr;
             if (!pp_hybrid_init.query(param_name, expr)) {
                 continue;
@@ -432,9 +475,35 @@ void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
                 "species.");
             auto parser = std::make_unique<amrex::Parser>(
                 utils::parser::makeParser(
-                    expr, {"rho_s","rho","Te","J","J_s","B","t"}));
-            m_eta_per_species[spec_name] = parser->compile<7>();
+                    expr, {"rho_s","rho","Te","Ti","J","J_s","B","t"}));
+            m_eta_per_species[spec_name] = parser->compile<8>();
             m_per_species_resistivity_parser[spec_name] = std::move(parser);
+        }
+
+        // The Ti arguments come from the shape-aware T_<species> deposits,
+        // whose deposition is auto-enabled at species construction (see
+        // PhysicalParticleContainer::ReadParameters): every charged species
+        // for the global weighted mean, the named species for a per-species
+        // overlay. Hitting these asserts indicates a species was created
+        // before the hybrid_pic_model resistivity parameters were readable.
+        if (m_resistivity_has_Ti_dependence) {
+            for (auto const & spec_name : mypc.GetSpeciesNames()) {
+                if (mypc.GetParticleContainerFromName(spec_name).getCharge() == 0._prt) {
+                    continue;
+                }
+                WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    mypc.GetParticleContainerFromName(spec_name).getTemperatureDepositionFlag(),
+                    "The Ti-dependent plasma_resistivity requires "
+                    "do_temperature_deposition on every charged ion species "
+                    "(it is enabled automatically at species construction).");
+            }
+        }
+        for (auto const & spec_name : m_per_species_eta_uses_Ti) {
+            WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+                mypc.GetParticleContainerFromName(spec_name).getTemperatureDepositionFlag(),
+                "The Ti-dependent plasma_resistivity_" + spec_name +
+                " requires do_temperature_deposition on that species "
+                "(it is enabled automatically at species construction).");
         }
 
         // Startup summary on rank 0: which species use only the global
@@ -455,7 +524,7 @@ void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
                         std::string expr;
                         pp_hybrid_init.query(
                             "plasma_resistivity_" + spec_name +
-                             "(rho_s,rho,Te,J,J_s,B,t)", expr);
+                             "(rho_s,rho,Te,Ti,J,J_s,B,t)", expr);
                         amrex::Print() << "    " << spec_name
                                        << "  : " << expr << "\n";
                     } else {
@@ -1123,6 +1192,14 @@ void HybridPICModel::ComputeResistiveOverlay (int const lev) const
         if (eta_s_per_it == m_eta_per_species.end()) { continue; }
         auto const eta_s_per = eta_s_per_it->second;
 
+        // This species' own scalar temperature (Kelvin, nodal), filled once
+        // per step by ComputeIonTemperatureFields; only fetched (and only
+        // allocated) when the expression actually uses Ti.
+        bool const has_Ti = (m_per_species_eta_uses_Ti.count(spec_name) > 0);
+        amrex::MultiFab const * Ti_s_mf = has_Ti
+            ? warpx.m_fields.get("hybrid_ion_temperature_fp_" + spec_name, lev)
+            : nullptr;
+
         amrex::MultiFab const & rho_s_mf =
             *warpx.m_fields.get("rho_fp_" + spec_name, lev);
         ablastr::fields::VectorField Vs_fp =
@@ -1165,6 +1242,9 @@ void HybridPICModel::ComputeResistiveOverlay (int const lev) const
                     Vs_fp[d_idx]->const_array(mfi);
                 amrex::Array4<amrex::Real const> const & Ved_arr =
                     Ve_fp[d_idx]->const_array(mfi);
+                // Default-constructed (never indexed) unless has_Ti.
+                amrex::Array4<amrex::Real const> Tis_arr;
+                if (has_Ti) { Tis_arr = Ti_s_mf->const_array(mfi); }
 
                 amrex::Box const & tbox = mfi.tilebox(out.ixType().toIntVect());
                 amrex::ParallelFor(tbox, [=] AMREX_GPU_DEVICE (int i, int j, int k)
@@ -1199,7 +1279,11 @@ void HybridPICModel::ComputeResistiveOverlay (int const lev) const
                     amrex::Real const Bmag = std::sqrt(bx*bx + by*by + bz*bz);
 
                     amrex::Real const dv_d  = Vsd_arr(i,j,k) - Ved_arr(i,j,k);
-                    amrex::Real const eta_s = eta_s_per(rhos_val, rho_val, Te_val,
+                    amrex::Real const Ti_val = has_Ti
+                        ? Interp(Tis_arr, nodal, d_stag, coarsen, i, j, k, 0)
+                        : 0.0_rt;
+                    amrex::Real const eta_s = eta_s_per(rhos_val, rho_val,
+                                                        Te_val, Ti_val,
                                                         Jmag, Jsmag, Bmag, t_new);
 
                     // Split about the current J_plasma: the coefficient
@@ -1229,6 +1313,181 @@ void HybridPICModel::ComputeResistiveOverlay (int const lev) const
     // No ghost exchange: the E-solve kernels only read the overlay and
     // coefficient at valid cells (the Yee E updates run on ungrown
     // tileboxes).
+}
+
+
+namespace
+{
+    /** Average the staggered array `src` (staggering `stag` per dimension,
+     *  1 = nodal) to the nodal point (i,j,k), clamping every read index
+     *  into the component's valid domain box [lo, hi]. At physical
+     *  boundaries (including the axis in radial geometries, where the
+     *  below-axis ghosts of the T_<species> deposits hold unfilled
+     *  remnants) the clamp turns the average one-sided instead of touching
+     *  a ghost value; interior box edges read the FillBoundary'd ghosts as
+     *  usual. Equal weights over the (up to 2^m) contributing points match
+     *  ablastr::coarsen::sample::Interp away from the boundaries. */
+    AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+    amrex::Real StaggeredToNodeClamped (
+        amrex::Array4<amrex::Real const> const & src,
+        amrex::GpuArray<int, 3> const & stag,
+        amrex::Dim3 const & lo, amrex::Dim3 const & hi,
+        int const i, int const j, int const k)
+    {
+        int const i0 = (stag[0] == 1) ? i : i - 1;
+        int const j0 = (stag[1] == 1) ? j : j - 1;
+        int const k0 = (stag[2] == 1) ? k : k - 1;
+        amrex::Real sum = 0.0_rt;
+        int count = 0;
+        for (int kk = k0; kk <= k; ++kk) {
+            for (int jj = j0; jj <= j; ++jj) {
+                for (int ii = i0; ii <= i; ++ii) {
+                    sum += src(amrex::Clamp(ii, lo.x, hi.x),
+                               amrex::Clamp(jj, lo.y, hi.y),
+                               amrex::Clamp(kk, lo.z, hi.z));
+                    ++count;
+                }
+            }
+        }
+        return sum / static_cast<amrex::Real>(count);
+    }
+}
+
+void HybridPICModel::ComputeIonTemperatureFields (int const lev) const
+{
+    ABLASTR_PROFILE("HybridPICModel::ComputeIonTemperatureFields()");
+
+    using ablastr::fields::Direction;
+    using warpx::fields::FieldType;
+
+    bool const need_global = m_resistivity_has_Ti_dependence;
+    if (!need_global && m_per_species_eta_uses_Ti.empty()) { return; }
+
+    auto & warpx = WarpX::GetInstance();
+    auto & mypc = warpx.GetPartContainer();
+    amrex::Periodicity const & period = warpx.Geom(lev).periodicity();
+
+    // The shape-aware T_<species> deposits are staggered like J.
+    amrex::GpuArray<int, 3> const Tx_stag = Jx_IndexType;
+    amrex::GpuArray<int, 3> const Ty_stag = Jy_IndexType;
+    amrex::GpuArray<int, 3> const Tz_stag = Jz_IndexType;
+
+    // Weighted-mean accumulators for the global field: the numerator is
+    // accumulated in hybrid_ion_temperature_fp itself, the weight sum in a
+    // per-call scratch multifab; both are divided out at the end.
+    amrex::MultiFab * Ti_glob = nullptr;
+    std::unique_ptr<amrex::MultiFab> wsum;
+    if (need_global) {
+        Ti_glob = warpx.m_fields.get("hybrid_ion_temperature_fp", lev);
+        Ti_glob->setVal(0.0_rt);
+        wsum = std::make_unique<amrex::MultiFab>(
+            Ti_glob->boxArray(), Ti_glob->DistributionMap(), 1, 0);
+        wsum->setVal(0.0_rt);
+    }
+
+    for (auto const & spec_name : mypc.GetSpeciesNames()) {
+        auto & pc = mypc.GetParticleContainerFromName(spec_name);
+        if (pc.getCharge() == 0._prt) { continue; }
+        bool const want_per_species =
+            (m_per_species_eta_uses_Ti.count(spec_name) > 0);
+        if (!need_global && !want_per_species) { continue; }
+        // InitData asserted the deposition flag on every species reached
+        // here; a charged do_not_deposit tracer without it carries zero
+        // rho_fp_<species> weight anyway, so skipping it leaves the
+        // weighted mean unchanged.
+        if (!pc.getTemperatureDepositionFlag()) { continue; }
+
+        // Sync the interior ghosts of the staggered components so the
+        // nodal collapse reads consistent neighbours at box edges.
+        ablastr::fields::VectorField T_vf =
+            warpx.m_fields.get_alldirs("T_" + spec_name, lev);
+        for (int idim = 0; idim < 3; ++idim) {
+            T_vf[idim]->FillBoundary(period);
+        }
+
+        // Valid domain box of each component, for the boundary clamp.
+        amrex::Box const & dom = warpx.Geom(lev).Domain();
+        amrex::Box const domx = amrex::convert(dom, T_vf[0]->ixType());
+        amrex::Box const domy = amrex::convert(dom, T_vf[1]->ixType());
+        amrex::Box const domz = amrex::convert(dom, T_vf[2]->ixType());
+        amrex::Dim3 const lox = amrex::lbound(domx), hix = amrex::ubound(domx);
+        amrex::Dim3 const loy = amrex::lbound(domy), hiy = amrex::ubound(domy);
+        amrex::Dim3 const loz = amrex::lbound(domz), hiz = amrex::ubound(domz);
+
+        amrex::MultiFab const * rho_s = need_global
+            ? warpx.m_fields.get("rho_fp_" + spec_name, lev) : nullptr;
+        amrex::MultiFab * Ti_s = want_per_species
+            ? warpx.m_fields.get("hybrid_ion_temperature_fp_" + spec_name, lev)
+            : nullptr;
+
+        amrex::MultiFab & iter_mf = need_global ? *Ti_glob : *Ti_s;
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+        for (amrex::MFIter mfi(iter_mf, TilingIfNotGPU()); mfi.isValid(); ++mfi)
+        {
+            amrex::Array4<amrex::Real const> const & Tx_arr = T_vf[0]->const_array(mfi);
+            amrex::Array4<amrex::Real const> const & Ty_arr = T_vf[1]->const_array(mfi);
+            amrex::Array4<amrex::Real const> const & Tz_arr = T_vf[2]->const_array(mfi);
+            // Default-constructed Array4s are never indexed: the matching
+            // bool gates each write below.
+            amrex::Array4<amrex::Real>       num_arr, w_arr, Tis_arr;
+            amrex::Array4<amrex::Real const> rhos_arr;
+            if (need_global) {
+                num_arr  = Ti_glob->array(mfi);
+                w_arr    = wsum->array(mfi);
+                rhos_arr = rho_s->const_array(mfi);
+            }
+            if (want_per_species) { Tis_arr = Ti_s->array(mfi); }
+
+            amrex::Box const & tbox = mfi.tilebox();
+            amrex::ParallelFor(tbox, [=] AMREX_GPU_DEVICE (int i, int j, int k)
+            {
+                // Isotropic scalar T_s = (Tx+Ty+Tz)/3 at the node, in
+                // Kelvin; the max guards the single-pass variance deposit's
+                // tiny negative roundoff in near-empty cells.
+                amrex::Real const T_node = amrex::max(0.0_rt,
+                    ( StaggeredToNodeClamped(Tx_arr, Tx_stag, lox, hix, i, j, k)
+                    + StaggeredToNodeClamped(Ty_arr, Ty_stag, loy, hiy, i, j, k)
+                    + StaggeredToNodeClamped(Tz_arr, Tz_stag, loz, hiz, i, j, k)
+                    ) / 3.0_rt);
+                if (want_per_species) {
+                    Tis_arr(i,j,k) = T_node;
+                }
+                if (need_global) {
+                    amrex::Real const w = amrex::max(rhos_arr(i,j,k), 0.0_rt);
+                    num_arr(i,j,k) += w * T_node;
+                    w_arr(i,j,k)   += w;
+                }
+            });
+        }
+
+        if (want_per_species) {
+            // Interior/periodic ghosts for the resistive drag's particle
+            // gather; out-of-domain ghosts stay zero (no consumer reads them).
+            Ti_s->FillBoundary(Ti_s->nGrowVect(), period);
+        }
+    }
+
+    if (need_global) {
+        // Divide out the weight sum: Ti = Sigma_s w_s T_s / Sigma_s w_s,
+        // zero where no ion charge was deposited.
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+        for (amrex::MFIter mfi(*Ti_glob, TilingIfNotGPU()); mfi.isValid(); ++mfi)
+        {
+            amrex::Array4<amrex::Real>       const & Ti_arr = Ti_glob->array(mfi);
+            amrex::Array4<amrex::Real const> const & w_arr  = wsum->const_array(mfi);
+            amrex::Box const & tbox = mfi.tilebox();
+            amrex::ParallelFor(tbox, [=] AMREX_GPU_DEVICE (int i, int j, int k)
+            {
+                amrex::Real const w = w_arr(i,j,k);
+                Ti_arr(i,j,k) = (w > 0.0_rt) ? Ti_arr(i,j,k) / w : 0.0_rt;
+            });
+        }
+        Ti_glob->FillBoundary(Ti_glob->nGrowVect(), period);
+    }
 }
 
 
@@ -1527,6 +1786,14 @@ void HybridPICModel::QDSMCAddJouleHeating (int const lev, amrex::Real const dt,
     auto const eta           = m_eta;
     auto const t_new         = warpx.gett_new(0);
 
+    // Optional temperature arguments of the global eta parser: Te is the
+    // (nodal, Kelvin) field this kernel updates, Ti the weighted-mean ion
+    // temperature filled by ComputeIonTemperatureFields earlier this step.
+    bool const eta_has_Te = m_resistivity_has_Te_dependence;
+    bool const eta_has_Ti = m_resistivity_has_Ti_dependence;
+    amrex::MultiFab const * Ti_glob_mf = eta_has_Ti
+        ? warpx.m_fields.get("hybrid_ion_temperature_fp", lev) : nullptr;
+
     amrex::GpuArray<int, 3> const & Jx_stag = Jx_IndexType;
     amrex::GpuArray<int, 3> const & Jy_stag = Jy_IndexType;
     amrex::GpuArray<int, 3> const & Jz_stag = Jz_IndexType;
@@ -1590,8 +1857,15 @@ void HybridPICModel::QDSMCAddJouleHeating (int const lev, amrex::Real const dt,
         // never invoked.
         auto const eta_per_it     = m_eta_per_species.find(spec_name);
         bool const has_eta_per    = (eta_per_it != m_eta_per_species.end());
-        amrex::ParserExecutor<7> eta_s_per{};
+        amrex::ParserExecutor<8> eta_s_per{};
         if (has_eta_per) { eta_s_per = eta_per_it->second; }
+
+        // This species' own scalar temperature, the Ti argument of its
+        // overlay parser (see ComputeIonTemperatureFields).
+        bool const has_Ti_per = (m_per_species_eta_uses_Ti.count(spec_name) > 0);
+        amrex::MultiFab const * Ti_s_mf = has_Ti_per
+            ? warpx.m_fields.get("hybrid_ion_temperature_fp_" + spec_name, lev)
+            : nullptr;
 
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
@@ -1611,6 +1885,10 @@ void HybridPICModel::QDSMCAddJouleHeating (int const lev, amrex::Real const dt,
             amrex::Array4<amrex::Real const> const & Bx_arr     = B_fp[0]->const_array(mfi);
             amrex::Array4<amrex::Real const> const & By_arr     = B_fp[1]->const_array(mfi);
             amrex::Array4<amrex::Real const> const & Bz_arr     = B_fp[2]->const_array(mfi);
+            // Default-constructed (never indexed) unless the matching bool.
+            amrex::Array4<amrex::Real const> Ti_glob_arr, Tis_arr;
+            if (eta_has_Ti) { Ti_glob_arr = Ti_glob_mf->const_array(mfi); }
+            if (has_Ti_per) { Tis_arr     = Ti_s_mf->const_array(mfi); }
 
             // Redirect output (default Array4 when redirect off -> never indexed
             // because do_redirect gates the write).
@@ -1643,7 +1921,15 @@ void HybridPICModel::QDSMCAddJouleHeating (int const lev, amrex::Real const dt,
                 // eta_global: same Ohm's-law parser the E-solve uses, evaluated
                 // per cell. This makes the per-cell heat reduce to eta J^2
                 // exactly in single species (when no per-species overlay).
-                amrex::Real eta_s_eff = eta(rho_val, Jmag, t_new);
+                // Optional temperature arguments: Te lives on this same nodal
+                // grid (mid-update by earlier species in this loop, like the
+                // per-species Te read below); Ti is the frozen per-step mean.
+                amrex::Real const Te_glob_val =
+                    eta_has_Te ? Te_arr(i,j,k) : 0.0_rt;
+                amrex::Real const Ti_glob_val =
+                    eta_has_Ti ? Ti_glob_arr(i,j,k) : 0.0_rt;
+                amrex::Real eta_s_eff =
+                    eta(rho_val, Jmag, t_new, Te_glob_val, Ti_glob_val);
 
                 // e-i relative drift = J_plasma/(e n_e), from the nodal plasma
                 // current and n_e. Energy-consistent with the eta*J dissipation
@@ -1670,7 +1956,9 @@ void HybridPICModel::QDSMCAddJouleHeating (int const lev, amrex::Real const dt,
                     auto const by = Interp(By_arr, By_stag, nodal, coarsen, i, j, k, 0);
                     auto const bz = Interp(Bz_arr, Bz_stag, nodal, coarsen, i, j, k, 0);
                     amrex::Real const Bmag = std::sqrt(bx*bx + by*by + bz*bz);
-                    eta_s_eff += eta_s_per(rhos_val, rho_val, Te_K_val,
+                    amrex::Real const Ti_s_val =
+                        has_Ti_per ? Tis_arr(i,j,k) : 0.0_rt;
+                    eta_s_eff += eta_s_per(rhos_val, rho_val, Te_K_val, Ti_s_val,
                                            Jmag, Jsmag, Bmag, t_new);
                 }
 

@@ -206,8 +206,12 @@ PhysicalParticleContainer::PhysicalParticleContainer (AmrCore* amr_core, int isp
 
     // The hybrid-PIC electron-ion temperature relaxation (Q_ei) needs the
     // shape-aware ion temperature of every charged species, so turn the
-    // deposition on automatically when it is configured. Done here (rather
-    // than in HybridPICModel) because the flag must be known by AllocData.
+    // deposition on automatically when it is configured. The same deposit
+    // feeds the Ti argument of the resistivity parsers: a Ti-dependent
+    // global plasma_resistivity needs every charged species (they enter
+    // the weighted-mean hybrid_ion_temperature_fp), a Ti-dependent
+    // per-species overlay needs that species. Done here (rather than in
+    // HybridPICModel) because the flag must be known by AllocData.
     if (!m_do_temperature_deposition && m_charge != 0._prt) {
         const ParmParse pp_hybrid("hybrid_pic_model");
         bool solve_electron_energy_equation = false;
@@ -216,6 +220,31 @@ PhysicalParticleContainer::PhysicalParticleContainer (AmrCore* amr_core, int isp
         if (solve_electron_energy_equation &&
             pp_hybrid.query("electron_ion_relaxation_rate(rho,Te,Ti,t)", nu_ei_expression)) {
             m_do_temperature_deposition = true;
+        }
+
+        // Ti symbol detection mirrors HybridPICModel::ReadParameters: parse
+        // the expression (with my_constants substituted) and look at the
+        // surviving symbols, so e.g. a user constant named Timax does not
+        // false-positive a substring match.
+        std::string eta_expression;
+        if (!m_do_temperature_deposition &&
+            pp_hybrid.query("plasma_resistivity(rho,J,t)", eta_expression)) {
+            auto const eta_parser = utils::parser::makeParser(
+                eta_expression, {"rho","J","t","Te","Ti"});
+            if (eta_parser.symbols().count("Ti") > 0) {
+                m_do_temperature_deposition = true;
+            }
+        }
+        std::string eta_s_expression;
+        if (!m_do_temperature_deposition &&
+            pp_hybrid.query(("plasma_resistivity_" + species_name +
+                             "(rho_s,rho,Te,Ti,J,J_s,B,t)").c_str(),
+                            eta_s_expression)) {
+            auto const eta_s_parser = utils::parser::makeParser(
+                eta_s_expression, {"rho_s","rho","Te","Ti","J","J_s","B","t"});
+            if (eta_s_parser.symbols().count("Ti") > 0) {
+                m_do_temperature_deposition = true;
+            }
         }
     }
 

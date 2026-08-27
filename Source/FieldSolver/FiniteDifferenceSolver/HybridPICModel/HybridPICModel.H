@@ -436,6 +436,33 @@ public:
      */
     void ComputeResistiveOverlay (int lev) const;
 
+    /**
+     * \brief Build the gridded ion-temperature fields consumed by the
+     *        resistivity parsers, once per step from the shape-aware
+     *        T_<species> deposits (Yee-staggered 3-component vectors in
+     *        Kelvin, deposited by HybridPICDepositRhoAndJ ->
+     *        DepositTemperatures):
+     *
+     *          hybrid_ion_temperature_fp (when the global
+     *          plasma_resistivity expression uses Ti):
+     *              the charge-density-weighted mean over charged species,
+     *                Ti = Sigma_s max(rho_s, 0) T_s / Sigma_s max(rho_s, 0),
+     *              on the nodal rho grid, in Kelvin (0 where no ion charge);
+     *
+     *          hybrid_ion_temperature_fp_<species> (for each species whose
+     *          per-species resistivity expression uses Ti):
+     *              that species' own scalar temperature on the same grid.
+     *
+     *        The per-cell scalar T_s is the isotropic average (Tx+Ty+Tz)/3
+     *        of the staggered components, interpolated to the node with
+     *        every read clamped into the component's valid domain box: the
+     *        average is one-sided at physical boundaries (and at the axis
+     *        in radial geometries) instead of touching unfilled ghost
+     *        values. Returns immediately when no resistivity expression
+     *        depends on Ti (the fields are then not allocated).
+     */
+    void ComputeIonTemperatureFields (int lev) const;
+
     /** Check if rkf45 should be used */
     [[nodiscard]] bool DoRKF45(int step) const { return m_rkf45_intervals.contains(step); }
 
@@ -525,23 +552,40 @@ public:
     /** Plasma density floor - if n < n_floor it will be set to n_floor */
     amrex::Real m_n_floor = 1.0;
 
-    /** Plasma resistivity */
+    /** Plasma resistivity, from the plasma_resistivity(rho,J,t) input.
+     *  Besides rho (C/m^3), |J| (A/m^2) and t (s), the expression may use
+     *  the temperatures Te and Ti (both Kelvin): Te is the electron
+     *  temperature the E-solve consumes (algebraic closure or evolved), Ti
+     *  the charge-density-weighted mean ion temperature over the charged
+     *  species (hybrid_ion_temperature_fp, see ComputeIonTemperatureFields).
+     *  This supports e.g. a Chodura anomalous resistivity whose drift
+     *  threshold is the thermal speed sqrt(kb*(Ti + Zeff*Te)/m_i), or a
+     *  Spitzer Te^-3/2 floor, evaluated at the actual local temperatures.
+     *  The executor argument order is (rho, J, t, Te, Ti); the
+     *  has-dependence flags below gate the temperature interpolation (and,
+     *  for Ti, the per-species temperature deposition) so expressions
+     *  without them carry zero extra cost. */
     std::string m_eta_expression = "0.0";
     std::unique_ptr<amrex::Parser> m_resistivity_parser;
-    amrex::ParserExecutor<3> m_eta;
+    amrex::ParserExecutor<5> m_eta;
     bool m_resistivity_has_J_dependence = false;
+    bool m_resistivity_has_Te_dependence = false;
+    /** Set in ReadParameters (AllocateLevelMFs gates the
+     *  hybrid_ion_temperature_fp allocation on it, and it forces
+     *  m_need_per_species_fields for the rho_fp_<species> weights). */
+    bool m_resistivity_has_Ti_dependence = false;
 
     /** Per-species resistivity overlay (see Phys. Plasmas 31, 012902 (2024), Eq. 10).
      *  Optional. For any charged species {spec} for which the user provides
      *
-     *      hybrid_pic_model.plasma_resistivity_{spec}(rho_s,rho,Te,J,J_s,B,t) = "..."
+     *      hybrid_pic_model.plasma_resistivity_{spec}(rho_s,rho,Te,Ti,J,J_s,B,t) = "..."
      *
      *  the parser is compiled and stored here. The total per-species
      *  effective resistivity used by Ohm's law, the Joule-heating source,
      *  and the resistive-drag operator is
      *
-     *      eta_s_eff = eta_global(rho, |J|, t)              [the global m_eta]
-     *                + eta_per_species_s(rho_s, rho, Te,    [this map]
+     *      eta_s_eff = eta_global(rho, |J|, t, Te, Ti)       [the global m_eta]
+     *                + eta_per_species_s(rho_s, rho, Te, Ti, [this map]
      *                                    |J|, |J_s|, |B|, t)
      *
      *  so the global parser remains the shared anomalous (e.g. Chodura)
@@ -552,17 +596,27 @@ public:
      *    rho_s : per-species charge density        (C/m^3)
      *    rho   : total plasma charge density       (C/m^3)
      *    Te    : electron temperature              (Kelvin)
+     *    Ti    : this species' own temperature     (Kelvin), the scalar
+     *            collapse of its shape-aware T_{spec} deposit
+     *            (hybrid_ion_temperature_fp_{spec}; note this is the
+     *            species' own T, not the species-averaged Ti the global
+     *            parser sees)
      *    J     : |J_plasma|                        (A/m^2)
      *    J_s   : |J_{species}|                     (A/m^2)
      *    B     : |B|                               (Tesla)
      *    t     : time                              (seconds)
      */
     std::map<std::string, std::unique_ptr<amrex::Parser>> m_per_species_resistivity_parser;
-    std::map<std::string, amrex::ParserExecutor<7>>       m_eta_per_species;
+    std::map<std::string, amrex::ParserExecutor<8>>       m_eta_per_species;
     /** True if at least one species has a registered per-species
      *  resistivity parser. Set in ReadParameters (so AllocateLevelMFs can
      *  gate the overlay fields); the parsers are compiled in InitData. */
     bool m_has_per_species_eta = false;
+    /** Names of the species whose per-species resistivity expression uses
+     *  the Ti symbol. Set in ReadParameters (it gates the per-species
+     *  hybrid_ion_temperature_fp_{spec} allocation and the temperature
+     *  deposition auto-enable). */
+    std::set<std::string> m_per_species_eta_uses_Ti;
 
     /** True when a hybrid_resistive_drag collision is present in the input
      *  deck. Set in ReadParameters. When true, the resistive terms of Ohm's
