@@ -219,3 +219,20 @@ Execute:
    Electron and ion temperatures relaxing to the common equilibrium value
    (left), the exponential decay of the temperature difference against the
    analytic rate (center), and the drift of the total thermal energy (right).
+
+Stationary remapping and Biermann battery
+----------------------------------------
+
+``inputs_test_electron_energy_equilibrium_picmi.py`` checks the QDSMC remap and electron-pressure contribution to Faraday's law in 2D Cartesian and RZ geometry.
+The ions are held fixed, resistivity and heating are off, and the electron temperature is set independently of density through the Python field interface.
+With ``--case stationary``, the density and temperature vary along the same direction: the temperature profile must remain unchanged and no magnetic field should appear.
+With ``--case biermann``, their gradients are perpendicular, and the generated transverse magnetic field is compared with :math:`\partial_t B_y = \frac{k_B}{e n_e}(\partial_x n_e)(\partial_z T_e)` (or :math:`B_\theta` and :math:`r` in RZ).
+The RZ comparison excludes two radial boundary cells, where the conducting wall imposes its own field condition.
+
+These short regressions are adapted from Prabhat Kumar's reproducing cases in `PR #7344 <https://github.com/BLAST-WarpX/warpx/pull/7344>`_.
+They use inline assertions and do not require diagnostic files or checksum baselines.
+Run either case with ``--geometry 2d`` or ``--geometry rz``, for example:
+
+.. code-block:: bash
+
+   mpiexec -n 2 python3 inputs_test_electron_energy_equilibrium_picmi.py --geometry rz --case biermann
